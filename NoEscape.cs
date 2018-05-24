@@ -65,7 +65,7 @@ namespace Oxide.Plugins
         bool clanCheck;
         bool friendCheck;
         bool raiderBlock;
-        List<string> raidDamageTypes;
+        List<DamageType> raidDamageTypes;
         List<string> combatDamageTypes;
 
         // RAID UNBLOCK SETTINGS
@@ -107,7 +107,8 @@ namespace Oxide.Plugins
         Dictionary<string, DateTime> lastCheck = new Dictionary<string, DateTime> ();
         Dictionary<string, DateTime> lastFriendCheck = new Dictionary<string, DateTime> ();
         Dictionary<string, bool> prefabBlockCache = new Dictionary<string, bool> ();
-        internal Dictionary<ulong, BlockBehavior> blockBehaviors = new Dictionary<ulong, BlockBehavior> ();
+        internal Dictionary<ulong, BlockBehavior> raidBlockBehaviors = new Dictionary<ulong, BlockBehavior>();
+        internal Dictionary<ulong, BlockBehavior> combatBlockBehaviors = new Dictionary<ulong, BlockBehavior>();
 
         public static NoEscape plugin;
 
@@ -319,10 +320,14 @@ namespace Oxide.Plugins
             raidDuration = GetConfig ("Raid", "Block", "duration", 300f);
             raidDistance = GetConfig ("Raid", "Block", "distance", 100f);
             raidBlockNotify = GetConfig ("Raid", "Block", "notify", true);
-            raidDamageTypes = GetConfig ("Raid", "Block", "damageTypes", GetDefaultRaidDamageTypes ());
-            blockedPrefabs = GetConfig ("Raid", "Block", "includePrefabs", blockedPrefabs);
+             blockedPrefabs = GetConfig ("Raid", "Block", "includePrefabs", blockedPrefabs);
             exceptionPrefabs = GetConfig ("Raid", "Block", "excludePrefabs", exceptionPrefabs);
             exceptionWeapons = GetConfig ("Raid", "Block", "excludeWeapons", exceptionWeapons);
+
+            List<string> temp = GetConfig("Raid", "Block", "damageTypes", GetDefaultRaidDamageTypes());
+            raidDamageTypes = new List<DamageType>();
+            foreach (string typeString in temp)
+                raidDamageTypes.Add((DamageType)Enum.Parse(typeof(DamageType), typeString));
 
             blockOnDamage = GetConfig ("Raid", "BlockWhen", "damage", true);
             blockOnDestroy = GetConfig ("Raid", "BlockWhen", "destroy", true);
@@ -529,11 +534,11 @@ namespace Oxide.Plugins
 
             void Awake ()
             {
-                player = GetComponent<BasePlayer> ();
-                if (plugin.blockBehaviors.ContainsKey (player.userID)) {
-                    plugin.blockBehaviors.Remove (player.userID);
-                }
-                plugin.blockBehaviors.Add (player.userID, this);
+                player = GetComponent<BasePlayer>();
+                if (this is RaidBlock)
+                    plugin.raidBlockBehaviors[(ulong)player.userID] = this;
+                else
+                    plugin.combatBlockBehaviors[(ulong)player.userID] = this;
             }
 
             void Destroy ()
@@ -584,7 +589,10 @@ namespace Oxide.Plugins
                 if (plugin.sendUINotification && player is BasePlayer && player.IsConnected)
                     CuiHelper.DestroyUi (player, "BlockMsg" + BlockName);
 
-                plugin.blockBehaviors.Remove (player.userID);
+                if (this is RaidBlock)
+                    plugin.raidBlockBehaviors.Remove(player.userID);
+                else
+                    plugin.combatBlockBehaviors.Remove(player.userID);
 
                 GameObject.Destroy (this);
             }
@@ -765,7 +773,7 @@ namespace Oxide.Plugins
                 return;
             if (hitInfo == null || hitInfo.WeaponPrefab == null || hitInfo.Initiator == null || !IsEntityBlocked (entity) || hitInfo.Initiator.transform == null || hitInfo.Initiator.transform.position == null)
                 return;
-            if (!IsRaidDamage (hitInfo.damageTypes.GetMajorityDamageType ()))
+            if (!IsRaidDamage (hitInfo.damageTypes))
                 return;
             if (IsExcludedWeapon (hitInfo.WeaponPrefab.ShortPrefabName))
                 return;
@@ -776,17 +784,19 @@ namespace Oxide.Plugins
         void OnPlayerInit (BasePlayer player)
         {
             BlockBehavior behavior;
-            if (blockBehaviors.TryGetValue (player.userID, out behavior)) {
-                if (behavior is RaidBlock) {
-                    var raidBlockComponent = player.gameObject.AddComponent<RaidBlock> ();
-                    raidBlockComponent.CopyFrom (behavior);
-                } else if (behavior is CombatBlock) {
-                    var combatBlockComponent = player.gameObject.AddComponent<CombatBlock> ();
-                    combatBlockComponent.CopyFrom (behavior);
-                }
 
+            if (raidBlockBehaviors.TryGetValue(player.userID, out behavior)) {
+                var raidBlockComponent = player.gameObject.AddComponent<RaidBlock>();
+                raidBlockComponent.CopyFrom(behavior);
                 behavior.moved = true;
-                GameObject.Destroy (behavior);
+                GameObject.Destroy(behavior);
+            }
+            
+            if (combatBlockBehaviors.TryGetValue(player.userID, out behavior)) {
+                var combatBlockComponent = player.gameObject.AddComponent<CombatBlock>();
+                combatBlockComponent.CopyFrom(behavior);
+                behavior.moved = true;
+                GameObject.Destroy(behavior);
             }
         }
 
@@ -814,7 +824,7 @@ namespace Oxide.Plugins
         void OnEntityDeath (BaseCombatEntity entity, HitInfo hitInfo)
         {
             if (blockOnDestroy && raidBlock) {
-                if (hitInfo == null || hitInfo.WeaponPrefab == null || hitInfo.Initiator == null || !IsRaidDamage (hitInfo.damageTypes.GetMajorityDamageType ()) || !IsEntityBlocked (entity))
+                if (hitInfo == null || hitInfo.WeaponPrefab == null || hitInfo.Initiator == null || !IsRaidDamage (hitInfo.damageTypes) || !IsEntityBlocked (entity))
                     return;
 
                 StructureAttack (entity, hitInfo.Initiator, hitInfo.WeaponPrefab.ShortPrefabName, hitInfo.HitPositionWorld);
@@ -1650,7 +1660,8 @@ namespace Oxide.Plugins
                 string message = string.Empty;
 
                 if (sendChatNotification || sendGUIAnnouncementsNotification)
-                    message = GetPrefix (target.UserIDString) + GetMsg (langMessage, target.UserIDString).Replace ("{time}", GetCooldownTime (blocker.Duration, target.UserIDString));
+                    message = GetPrefix (target.UserIDString) + 
+						GetMsg (langMessage, target.UserIDString).Replace ("{time}", GetFormatedTime (blocker.Duration, target.UserIDString));
 
                 if (sendChatNotification)
                     SendReply (target, message);
@@ -1691,12 +1702,11 @@ namespace Oxide.Plugins
             });
         }
 
-        string GetCooldownTime (float f, string userID)
+        string GetFormatedTime (float seconds, string userID)
         {
-            if (f > 60)
-                return Math.Round (f / 60, 1) + " " + GetMsg ("Unit Minutes", userID);
-
-            return f + " " + GetMsg ("Unit Seconds", userID);
+            var timespan = TimeSpan.FromSeconds( seconds );
+            return string.Format( timespan.TotalHours >= 1 ? "{2:00}:{0:00}:{1:00}" : "{0:00}:{1:00}", timespan.Minutes, timespan.Seconds, System.Math.Floor( timespan.TotalHours ) ) +
+                " " + GetMsg( "Unit Minutes", userID );
         }
 
         public string GetMessage (BasePlayer player)
@@ -1723,17 +1733,9 @@ namespace Oxide.Plugins
         {
             T blocker;
             if (duration > 0 && TryGetBlocker<T> (player, out blocker)) {
-                var ts = DateTime.Now - blocker.lastBlock;
-                var unblocked = Math.Round ((duration / 60) - Convert.ToSingle (ts.TotalMinutes), 2);
-
-                if (ts.TotalMinutes <= duration) {
-                    if (unblocked < 1) {
-                        var timelefts = Math.Round (Convert.ToDouble (duration) - ts.TotalSeconds);
-                        return GetPrefix (player.UserIDString) + GetMsg (blockMsg, player).Replace ("{time}", timelefts.ToString () + " " + GetMsg ("Unit Seconds", player));
-                    }
-
-                    return GetPrefix (player.UserIDString) + GetMsg (blockMsg, player).Replace ("{time}", unblocked.ToString () + " " + GetMsg ("Unit Minutes", player));
-                }
+                double seconds = (DateTime.Now - blocker.lastBlock).TotalSeconds; 
+                return GetPrefix( player.UserIDString ) + 
+                    GetMsg( blockMsg, player ).Replace( "{time}", GetFormatedTime( (float)(duration - seconds), player.UserIDString ) );
             }
 
             return null;
@@ -1796,9 +1798,13 @@ namespace Oxide.Plugins
             return result;
         }
 
-        bool IsRaidDamage (DamageType dt)
+        bool IsRaidDamage(DamageTypeList dtList)
         {
-            return raidDamageTypes.Contains (dt.ToString ());
+            foreach (DamageType dt in raidDamageTypes)
+                if (dtList.Has(dt))
+                    return true;
+  
+            return false;
         }
 
         bool IsExcludedWeapon (string name)
